@@ -82,7 +82,7 @@ BUGS/ISSUES
 
 code=''
 stdin=''
-parallel=false
+parallel=true
 X=false
 interactive=false
 
