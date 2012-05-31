@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -e
+
+helpstr="\
+NAME
+    runsh - run shell code on hosts in series or parallel
+
+SYNOPSIS
+    runsh [--parallel] -c CODE   HOST...
+    runsh [--parallel] -s SCRIPT HOST...
+
+DESCRIPTION
+    Run shell code or a local script file on remote hosts.  By default, this 
+    run the commands in series and prints to the terminal.  But there are 
+    options for running parallel xterm windows, and for directing output to 
+    files.
+
+GENERAL OPTIONS
+    -c, --code CODE
+    	Run the given code.
+
+    -s, --script SCRIPT
+    	Run the given script (a local file).  It's piped into the ssh 
+    	processes, so use with care (there are no known bugs, but piping in the 
+    	wrong thing or accidentally reading from the terminal could be bad).
+
+    --series
+    	Execute in series (default).  See SERIES OPTIONS below.
+
+    --parallel
+    	Execute in parallel, by opening xterms.  Most useful with -X or 
+		--output-to-files.  See PARALLEL OPTIONS below.
+	
+	-X
+		Run each host's code in a separate xterm.
+	
+	-i, --interactive
+		Allow input.
+    
+    --output-to-files
+    	Write to files instead of to the screen.  Two files will be created for 
+    	each given HOST: HOST.stdout and HOST.stderr.
+	
+    -f, --fanout NUMBER
+    	With --parallel, run a maximum of NUMBER processes at a time.  Default 
+		is 20.
+    
+    --connect-timeout
+    	The timeout, in seconds, for connecting to the HOST.  Default is 10 
+    	seconds.
+    
+	--headers TYPE
+		How to print out headers, identifying the hostname, around the output.  
+		Only applies to non-X output.  See also -v, --verbose.
+		
+		Possible values for TYPE:
+			auto
+				Pick whether or not to print them smartly (but always
+				multiline).
+			multiline
+				A dedicated header line before the output and blank line after.
+			inline
+				Prefix each line of the output with the hostname.
+			none
+				No headers.
+	
+	-v, --verbose
+		Print out some extra indentifying information about what it's working 
+		on.  Useful with -X or with --headers=inline when there is no output, 
+		since in that case nothing would otherwise be printed.
+	
+	-d, --debug
+		Print commands instead of running them.
+
+	-h, --help
+		Print this help.
+
+BUGS/ISSUES
+	There are explicit calls to \$SHELL used.  There will quite likely be 
+    problems if a remote host has a different default shell.
+"
+
+code=''
+stdin=''
+parallel=true
+X=false
+interactive=false
+
+output_to_files=false
+fanout=20
+connect_timeout=10
+
+headers='auto'
+
+x0=40
+y0=40
+delta=22
+xterm_width=175
+xterm_height=40
+
+ttyopts='-T'  #passed to ssh; -t enables tty, -T disables
+
+verbose=false
+prefix=''  #set to the string echo in order to echo commands intead of running them (corresponds to -d/--debug)
+
+args=$(getopt -l code:,script:,series,parallel,interactive,output-to-files,fanout:,connect-timeout:,headers:,verbose,debug,help -o c:s:Xif:vdh -- "$@")
+if [ $? -ne 0 ]; then
+	exit 65  #(getopt will have written the error message)
+fi
+eval set -- "$args"
+while [ ! -z "$1" ]; do
+	case "$1" in
+		-c | --code)
+			code="$2"
+			stdin=/dev/null
+			shift
+			;;
+		-s | --script)
+			code="$SHELL"
+			stdin="$2"
+			shift
+			;;
+
+		--series)
+			parallel=false
+			;;
+		--parallel)
+			parallel=true
+			;;
+
+		-X)
+			X=true
+			;;
+		-i | --interactive)
+			stdin=/dev/stdin
+			ttyopts='-t'
+			;;
+		
+		--output-to-files)
+			output_to_files=true
+			;;
+		-f | --fanout)
+			fanout="$2"
+			shift
+			;;
+		--connect-timeout)
+			connect_timeout="$2"
+			shift
+			;;
+
+		--headers)
+			headers="$2"
+			case "$headers" in
+				auto | multiline | inline | none)
+					;;
+				*)
+					echo "*** ERROR *** [$headers] is not a valid value for --headers" >&2
+					exit 65
+					;;
+			esac
+			;;
+
+		-v | --verbose)
+			verbose=true
+			;;
+		-d | --debug)
+			prefix=echo
+			;;
+		-h | --help)
+			echo -n "$helpstr"
+			exit 0
+			;;
+		--) shift
+			break
+			;;
+	esac
+	shift
+done
+
+if [ -z "$code" ]; then
+	if [ -z "$interactive" ]; then
+		echo "*** ERROR *** no code or script given (use -c or -s)" >&2
+		exit 65
+	else
+		input="$SHELL"
+	fi
+fi
+
+sshopts="-o ConnectTimeout=$connect_timeout"
+
+if [ "$headers" = auto ]; then
+	if $parallel; then
+		headers=inline
+	else
+		headers=multiline
+	fi
+fi
+
+if [ "$#" -eq 0 ]; then
+	echo "*** ERROR *** no hosts given" >&2
+	exit 65
+fi
+
+set -u
+
+
+#---
+
+function formatter() {
+	prefix=''
+	test "$headers" = inline && prefix="${1}: "
+	sed 's/^/'"$prefix"'/'
+}
+
+if $X; then
+	if [ -z "${DISPLAY:-}" ]; then
+		echo "*** ERROR *** DISPLAY is not set, cannot run X clients" >&2
+		exit 1
+	fi
+
+	#figure out the screen resolution and set xmax and ymax at which to wrap
+	res=$(xrandr 2>/dev/null | awk '$2 ~ /.*\*/ {print $1}')  #e.g. format:    1680x1050      50.0*
+	if ! echo "$res" | grep -q '[0-9]\+x[0-9]\+'; then
+		res=$(xrandr 2>/dev/null | awk '$1 ~ /\*.*/ {print $2"x"$4}')  #e.g. format: *0   1680 x 1050   ( 431mm x 272mm )  *50
+		if ! echo "$res" | grep -q '[0-9]\+x[0-9]\+'; then
+			res=800x600
+		fi
+	fi
+	xmax=$(echo "${res##*x} * 3/4" | bc)
+	ymax=$(echo "${res%%x*} * 3/4" | bc)
+
+	x=$x0
+	y=$y0
+fi
+
+set +e
+for host in "$@"; do
+	if $output_to_files; then
+		stdout=${host}.stdout
+		stderr=${host}.stderr
+	else
+		stdout=/dev/stdout
+		stderr=/dev/stderr
+	fi
+
+	if $X; then
+		$verbose && echo "working on ${host}..."
+
+		#xterm -geometry "${xterm_width}x${xterm_height}+${x}+${y}" -title "${host}" -e ssh -t $sshopts "$host" "$code; echo 'Hit <ENTER> to exit'; read junk" &
+		if $parallel; then
+			$prefix xterm -geometry "${xterm_width}x${xterm_height}+${x}+${y}" -title "$host" -e 'ssh '"$ttyopts"' '"$sshopts"' '\'"$host"\'' '\'"$code"\'' <'\'"$stdin"\''; echo '\''Hit <ENTER> to exit'\''; read junk' &
+		else
+			$prefix xterm -geometry "${xterm_width}x${xterm_height}+${x}+${y}" -title "$host" -e 'ssh '"$ttyopts"' '"$sshopts"' '\'"$host"\'' '\'"$code"\'' <'\'"$stdin"\''; echo '\''Hit <ENTER> to exit'\''; read junk'
+		fi
+		x=$(( (x + delta) % xmax ))
+		y=$(( (y + delta) % ymax ))
+
+		#ctrl-c stuff not really applicable here, since you can close the windows individually
+		#a ctrl-c will automatically kill the whole thing
+	else
+		if [ "$headers" = multiline ]; then
+			echo "=== $host ==="
+		elif $verbose; then
+			echo "working on ${host}..."
+		fi
+		
+		if $parallel; then
+			$prefix ssh $ttyopts $sshopts "$host" "$code" <"$stdin" >"$stdout" 2>"$stderr" | formatter "$host" &
+		else
+			$prefix ssh $ttyopts $sshopts "$host" "$code" <"$stdin" >"$stdout" 2>"$stderr" | formatter "$host"
+		fi
+		
+		#if user hit ctrl-c, ask to keep going or quit entirely
+		if [ "$?" -eq 130 ]; then
+			if [ -t 0 ] && [ -t 2 ]; then
+				echo
+				echo
+				echo "Execution on host [$host] interrupted." >&2
+				while true; do
+					echo -n "Keep going with next host [y|n]? " >&2
+					read go
+					if [[ "$go" == y* ]] || [[ "$go" == Y* ]]; then
+						echo
+						break
+					elif [[ "$go" == n* ]] || [[ "$go" == N* ]]; then
+						exit 130
+					fi
+				done
+			else
+				exit 130
+			fi
+		fi
+		
+		test "$headers" = multiline && echo 
+	fi
+	
+	
+	if $parallel; then
+		while [ "$(jobs -r | wc -l)" -ge "$fanout" ]; do
+			sleep 0.5
+		done
+	fi
+done
+$parallel && wait
+set -e
