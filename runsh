@@ -40,7 +40,8 @@ GENERAL OPTIONS
     
     --output-to-files
         Write to files instead of to the screen.  Two files will be created for 
-        each given HOST: HOST.stdout and HOST.stderr.
+        each given HOST: HOST.stdout and HOST.stderr.  Make sure not to specify 
+        the same host more than once in the argument list.
     
     -f, --fanout NUMBER
         With --parallel, run a maximum of NUMBER processes at a time.  Default 
@@ -79,6 +80,9 @@ GENERAL OPTIONS
 BUGS/ISSUES
     There are explicit calls to \$SHELL used.  There will quite likely be 
     problems if a remote host has a different default shell.
+
+AUTHOR
+    John Brunelle
 "
 
 code=''
@@ -179,8 +183,8 @@ while [ ! -z "$1" ]; do
 done
 
 if [ -z "$code" ]; then
-	if [ -z "$interactive" ]; then
-		echo "*** ERROR *** no code or script given (use -c or -s)" >&2
+	if ! $interactive; then
+		echo "*** ERROR *** no code or script given, and not using interactive mode (use -c, -s, or -i)" >&2
 		exit 65
 	else
 		input="$SHELL"
@@ -195,6 +199,10 @@ if [ "$headers" = auto ]; then
 	else
 		headers=multiline
 	fi
+	if $output_to_files; then
+		headers=none
+	fi
+	#(headers it not used at all for X, so don't care about that case)
 fi
 
 if [ "$#" -eq 0 ]; then
@@ -270,9 +278,9 @@ for host in "$@"; do
 		fi
 		
 		if $parallel; then
-			$prefix ssh $ttyopts $sshopts "$host" "$code" <"$stdin" >"$stdout" 2>"$stderr" | formatter "$host" &
+			( ( exec 3>&1; $prefix ssh $ttyopts $sshopts "$host" "$code" 2>&1 >&3 3>&- | formatter "$host" >&2 3>&-; exec 3>&-) | formatter "$host" ) <"$stdin" >"$stdout" 2>"$stderr" &
 		else
-			$prefix ssh $ttyopts $sshopts "$host" "$code" <"$stdin" >"$stdout" 2>"$stderr" | formatter "$host"
+			( ( exec 3>&1; $prefix ssh $ttyopts $sshopts "$host" "$code" 2>&1 >&3 3>&- | formatter "$host" >&2 3>&-; exec 3>&-) | formatter "$host" ) <"$stdin" >"$stdout" 2>"$stderr"
 		fi
 		
 		#if user hit ctrl-c, ask to keep going or quit entirely
