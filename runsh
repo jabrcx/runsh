@@ -217,7 +217,14 @@ set -u
 
 test "$(uname)" = Darwin && xargsnrie='' || xargsnrie='-r'
 
-trap 'exec 3>&2 2>/dev/null; ps -o "pid pgrp comm" | awk "\$2==$$ && \$1!=$$ && \$3!~/ps|awk|xargs|kill/ {print \$1}" | xargs '$xargsnrie' kill -KILL &>/dev/null; wait; exec 2>&3-' EXIT
+#function cleanup () {
+#	exec 3>&2 2>/dev/null
+#	ps -o "pid pgrp comm" | awk "\$2==$$ && \$1!=$$ && \$3!~/ps|awk|xargs|kill/ {print \$1}" | xargs '$xargsnrie' kill -KILL &>/dev/null
+#	wait
+#	exec 2>&3-
+#}
+#trap 'cleanup' SIGINT SIGTERM
+trap 'exec 3>&2 2>/dev/null; ps -o "pid pgrp comm" | awk "\$2==$$ && \$1!=$$ && \$3!~/ps|awk|xargs|kill/ {print \$1}" | xargs '$xargsnrie' kill -KILL &>/dev/null; wait; exec 2>&3-' SIGINT SIGTERM
 
 function formatter() {
 	prefix=''
